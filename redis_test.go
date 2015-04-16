@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/redis.v2"
+	"github.com/SocialExplorerFork/redis"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -122,7 +122,7 @@ var _ = Describe("Client", func() {
 
 func TestGinkgoSuite(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "gopkg.in/redis.v2")
+	RunSpecs(t, "github.com/SocialExplorerFork/redis")
 }
 
 func execCmd(name string, args ...string) (*os.Process, error) {

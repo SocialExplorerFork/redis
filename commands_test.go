@@ -9,7 +9,7 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"gopkg.in/redis.v2"
+	"github.com/SocialExplorerFork/redis"
 )
 
 var _ = Describe("Commands", func() {
