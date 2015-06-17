@@ -3,11 +3,13 @@ package redis
 import (
 	"errors"
 	"fmt"
+	"log"
 )
 
 var errDiscard = errors.New("redis: Discard can be used only inside Exec")
 
-// Not thread-safe.
+// Multi implements Redis transactions as described in
+// http://redis.io/topics/transactions.
 type Multi struct {
 	commandable
 
@@ -17,7 +19,10 @@ type Multi struct {
 
 func (c *Client) Multi() *Multi {
 	multi := &Multi{
-		base: &baseClient{opt: c.opt, connPool: newSingleConnPool(c.connPool, true)},
+		base: &baseClient{
+			opt:      c.opt,
+			connPool: newSingleConnPool(c.connPool, true),
+		},
 	}
 	multi.commandable.process = multi.process
 	return multi
@@ -33,7 +38,7 @@ func (c *Multi) process(cmd Cmder) {
 
 func (c *Multi) Close() error {
 	if err := c.Unwatch().Err(); err != nil {
-		return err
+		log.Printf("redis: Unwatch failed: %s", err)
 	}
 	return c.base.Close()
 }
@@ -84,13 +89,8 @@ func (c *Multi) Exec(f func() error) ([]Cmder, error) {
 	}
 
 	err = c.execCmds(cn, cmds)
-	if err != nil {
-		c.base.freeConn(cn, err)
-		return cmds[1 : len(cmds)-1], err
-	}
-
-	c.base.putConn(cn)
-	return cmds[1 : len(cmds)-1], nil
+	c.base.putConn(cn, err)
+	return cmds[1 : len(cmds)-1], err
 }
 
 func (c *Multi) execCmds(cn *conn, cmds []Cmder) error {

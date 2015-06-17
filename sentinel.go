@@ -11,79 +11,47 @@ import (
 
 //------------------------------------------------------------------------------
 
+// FailoverOptions are used to configure a failover client and should
+// be passed to NewFailoverClient.
 type FailoverOptions struct {
 	// The master name.
 	MasterName string
-	// Seed addresses of sentinel nodes.
+	// A seed list of host:port addresses of sentinel nodes.
 	SentinelAddrs []string
 
-	// An optional password. Must match the password specified in the
-	// `requirepass` server configuration option.
-	Password string
-	// Select a database.
-	// Default: 0
-	DB int64
+	// Following options are copied from Options struct.
 
-	// Sets the deadline for establishing new connections. If reached,
-	// deal attepts will fail with a timeout.
-	DialTimeout time.Duration
-	// Sets the deadline for socket reads. If reached, commands will
-	// fail with a timeout instead of blocking.
-	ReadTimeout time.Duration
-	// Sets the deadline for socket writes. If reached, commands will
-	// fail with a timeout instead of blocking.
+	Password string
+	DB       int64
+
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	// The maximum number of socket connections.
-	// Default: 10
-	PoolSize int
-	// If all socket connections is the pool are busy, the pool will wait
-	// this amount of time for a conection to become available, before
-	// returning an error.
-	// Default: 5s
+	PoolSize    int
 	PoolTimeout time.Duration
-	// Evict connections from the pool after they have been idle for longer
-	// than specified in this option.
-	// Default: 0 = no eviction
 	IdleTimeout time.Duration
 }
 
-func (opt *FailoverOptions) getPoolSize() int {
-	if opt.PoolSize == 0 {
-		return 10
-	}
-	return opt.PoolSize
-}
+func (opt *FailoverOptions) options() *Options {
+	return &Options{
+		Addr: "FailoverClient",
 
-func (opt *FailoverOptions) getPoolTimeout() time.Duration {
-	if opt.PoolTimeout == 0 {
-		return 5 * time.Second
-	}
-	return opt.PoolTimeout
-}
-
-func (opt *FailoverOptions) getDialTimeout() time.Duration {
-	if opt.DialTimeout == 0 {
-		return 5 * time.Second
-	}
-	return opt.DialTimeout
-}
-
-func (opt *FailoverOptions) options() *options {
-	return &options{
 		DB:       opt.DB,
 		Password: opt.Password,
 
-		DialTimeout:  opt.getDialTimeout(),
+		DialTimeout:  opt.DialTimeout,
 		ReadTimeout:  opt.ReadTimeout,
 		WriteTimeout: opt.WriteTimeout,
 
-		PoolSize:    opt.getPoolSize(),
-		PoolTimeout: opt.getPoolTimeout(),
+		PoolSize:    opt.PoolSize,
+		PoolTimeout: opt.PoolTimeout,
 		IdleTimeout: opt.IdleTimeout,
 	}
 }
 
+// NewFailoverClient returns a Redis client with automatic failover
+// capabilities using Redis Sentinel.
 func NewFailoverClient(failoverOpt *FailoverOptions) *Client {
 	opt := failoverOpt.options()
 	failover := &sentinelFailover{
@@ -102,16 +70,10 @@ type sentinelClient struct {
 	*baseClient
 }
 
-func newSentinel(clOpt *Options) *sentinelClient {
-	opt := clOpt.options()
-	opt.Password = ""
-	opt.DB = 0
-	dialer := func() (net.Conn, error) {
-		return net.DialTimeout("tcp", clOpt.Addr, opt.DialTimeout)
-	}
+func newSentinel(opt *Options) *sentinelClient {
 	base := &baseClient{
 		opt:      opt,
-		connPool: newConnPool(newConnFunc(dialer), opt),
+		connPool: newConnPool(opt),
 	}
 	return &sentinelClient{
 		baseClient:  base,
@@ -144,7 +106,7 @@ type sentinelFailover struct {
 	masterName    string
 	sentinelAddrs []string
 
-	opt *options
+	opt *Options
 
 	pool     pool
 	poolOnce sync.Once
@@ -163,7 +125,8 @@ func (d *sentinelFailover) dial() (net.Conn, error) {
 
 func (d *sentinelFailover) Pool() pool {
 	d.poolOnce.Do(func() {
-		d.pool = newConnPool(newConnFunc(d.dial), d.opt)
+		d.opt.Dialer = d.dial
+		d.pool = newConnPool(d.opt)
 	})
 	return d.pool
 }
@@ -188,9 +151,6 @@ func (d *sentinelFailover) MasterAddr() (string, error) {
 	for i, sentinelAddr := range d.sentinelAddrs {
 		sentinel := newSentinel(&Options{
 			Addr: sentinelAddr,
-
-			DB:       d.opt.DB,
-			Password: d.opt.Password,
 
 			DialTimeout:  d.opt.DialTimeout,
 			ReadTimeout:  d.opt.ReadTimeout,

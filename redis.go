@@ -1,6 +1,7 @@
-package redis // import "github.com/SocialExplorerFork/redis"
+package redis // import "gopkg.in/redis.v3"
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"time"
@@ -8,105 +9,74 @@ import (
 
 type baseClient struct {
 	connPool pool
-	opt      *options
+	opt      *Options
+}
+
+func (c *baseClient) String() string {
+	return fmt.Sprintf("Redis<%s db:%d>", c.opt.Addr, c.opt.DB)
 }
 
 func (c *baseClient) conn() (*conn, error) {
-	cn, isNew, err := c.connPool.Get()
-	if err != nil {
-		return nil, err
-	}
-
-	if isNew {
-		if err := c.initConn(cn); err != nil {
-			c.removeConn(cn)
-			return nil, err
-		}
-	}
-
-	return cn, nil
+	return c.connPool.Get()
 }
 
-func (c *baseClient) initConn(cn *conn) error {
-	if c.opt.Password == "" && c.opt.DB == 0 {
-		return nil
-	}
-
-	pool := newSingleConnPool(c.connPool, false)
-	pool.SetConn(cn)
-
-	// Client is not closed because we want to reuse underlying connection.
-	client := newClient(c.opt, pool)
-
-	if c.opt.Password != "" {
-		if err := client.Auth(c.opt.Password).Err(); err != nil {
-			return err
-		}
-	}
-
-	if c.opt.DB > 0 {
-		if err := client.Select(c.opt.DB).Err(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (c *baseClient) freeConn(cn *conn, ei error) error {
+func (c *baseClient) putConn(cn *conn, ei error) {
+	var err error
 	if cn.rd.Buffered() > 0 {
-		return c.connPool.Remove(cn)
+		err = c.connPool.Remove(cn)
 	} else if ei == nil {
-		return c.connPool.Put(cn)
+		err = c.connPool.Put(cn)
 	} else if _, ok := ei.(redisError); ok {
-		return c.connPool.Put(cn)
+		err = c.connPool.Put(cn)
+	} else {
+		err = c.connPool.Remove(cn)
 	}
-	return c.connPool.Remove(cn)
-}
-
-func (c *baseClient) removeConn(cn *conn) {
-	if err := c.connPool.Remove(cn); err != nil {
-		log.Printf("pool.Remove failed: %s", err)
-	}
-}
-
-func (c *baseClient) putConn(cn *conn) {
-	if err := c.connPool.Put(cn); err != nil {
-		log.Printf("pool.Put failed: %s", err)
+	if err != nil {
+		log.Printf("redis: putConn failed: %s", err)
 	}
 }
 
 func (c *baseClient) process(cmd Cmder) {
-	cn, err := c.conn()
-	if err != nil {
-		cmd.setErr(err)
+	for i := 0; i <= c.opt.MaxRetries; i++ {
+		if i > 0 {
+			cmd.reset()
+		}
+
+		cn, err := c.conn()
+		if err != nil {
+			cmd.setErr(err)
+			return
+		}
+
+		if timeout := cmd.writeTimeout(); timeout != nil {
+			cn.WriteTimeout = *timeout
+		} else {
+			cn.WriteTimeout = c.opt.WriteTimeout
+		}
+
+		if timeout := cmd.readTimeout(); timeout != nil {
+			cn.ReadTimeout = *timeout
+		} else {
+			cn.ReadTimeout = c.opt.ReadTimeout
+		}
+
+		if err := cn.writeCmds(cmd); err != nil {
+			c.putConn(cn, err)
+			cmd.setErr(err)
+			if shouldRetry(err) {
+				continue
+			}
+			return
+		}
+
+		err = cmd.parseReply(cn.rd)
+		c.putConn(cn, err)
+		if shouldRetry(err) {
+			continue
+		}
+
 		return
 	}
-
-	if timeout := cmd.writeTimeout(); timeout != nil {
-		cn.writeTimeout = *timeout
-	} else {
-		cn.writeTimeout = c.opt.WriteTimeout
-	}
-
-	if timeout := cmd.readTimeout(); timeout != nil {
-		cn.readTimeout = *timeout
-	} else {
-		cn.readTimeout = c.opt.ReadTimeout
-	}
-
-	if err := cn.writeCmds(cmd); err != nil {
-		c.freeConn(cn, err)
-		cmd.setErr(err)
-		return
-	}
-
-	if err := cmd.parseReply(cn.rd); err != nil {
-		c.freeConn(cn, err)
-		return
-	}
-
-	c.putConn(cn)
 }
 
 // Close closes the client, releasing any open resources.
@@ -116,24 +86,11 @@ func (c *baseClient) Close() error {
 
 //------------------------------------------------------------------------------
 
-type options struct {
-	Password string
-	DB       int64
-
-	DialTimeout  time.Duration
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-
-	PoolSize    int
-	PoolTimeout time.Duration
-	IdleTimeout time.Duration
-}
-
 type Options struct {
-	// The network type, either "tcp" or "unix".
-	// Default: "tcp"
+	// The network type, either tcp or unix.
+	// Default is tcp.
 	Network string
-	// The network address.
+	// host:port address.
 	Addr string
 
 	// Dialer creates new network connection and has priority over
@@ -141,14 +98,17 @@ type Options struct {
 	Dialer func() (net.Conn, error)
 
 	// An optional password. Must match the password specified in the
-	// `requirepass` server configuration option.
+	// requirepass server configuration option.
 	Password string
-	// Select a database.
-	// Default: 0
+	// A database to be selected after connecting to server.
 	DB int64
 
+	// The maximum number of retries before giving up.
+	// Default is to not retry failed commands.
+	MaxRetries int
+
 	// Sets the deadline for establishing new connections. If reached,
-	// deal attepts will fail with a timeout.
+	// dial will fail with a timeout.
 	DialTimeout time.Duration
 	// Sets the deadline for socket reads. If reached, commands will
 	// fail with a timeout instead of blocking.
@@ -158,16 +118,15 @@ type Options struct {
 	WriteTimeout time.Duration
 
 	// The maximum number of socket connections.
-	// Default: 10
+	// Default is 10 connections.
 	PoolSize int
-	// If all socket connections is the pool are busy, the pool will wait
-	// this amount of time for a conection to become available, before
-	// returning an error.
-	// Default: 5s
+	// Specifies amount of time client waits for connection if all
+	// connections are busy before returning an error.
+	// Default is 5 seconds.
 	PoolTimeout time.Duration
-	// Evict connections from the pool after they have been idle for longer
-	// than specified in this option.
-	// Default: 0 = no eviction
+	// Specifies amount of time after which client closes idle
+	// connections. Should be less than server's timeout.
+	// Default is to not close idle connections.
 	IdleTimeout time.Duration
 }
 
@@ -176,6 +135,15 @@ func (opt *Options) getNetwork() string {
 		return "tcp"
 	}
 	return opt.Network
+}
+
+func (opt *Options) getDialer() func() (net.Conn, error) {
+	if opt.Dialer == nil {
+		opt.Dialer = func() (net.Conn, error) {
+			return net.DialTimeout(opt.getNetwork(), opt.Addr, opt.getDialTimeout())
+		}
+	}
+	return opt.Dialer
 }
 
 func (opt *Options) getPoolSize() int {
@@ -194,24 +162,13 @@ func (opt *Options) getDialTimeout() time.Duration {
 
 func (opt *Options) getPoolTimeout() time.Duration {
 	if opt.PoolTimeout == 0 {
-		return 5 * time.Second
+		return 1 * time.Second
 	}
 	return opt.PoolTimeout
 }
 
-func (opt *Options) options() *options {
-	return &options{
-		DB:       opt.DB,
-		Password: opt.Password,
-
-		DialTimeout:  opt.getDialTimeout(),
-		ReadTimeout:  opt.ReadTimeout,
-		WriteTimeout: opt.WriteTimeout,
-
-		PoolSize:    opt.getPoolSize(),
-		PoolTimeout: opt.getPoolTimeout(),
-		IdleTimeout: opt.IdleTimeout,
-	}
+func (opt *Options) getIdleTimeout() time.Duration {
+	return opt.IdleTimeout
 }
 
 //------------------------------------------------------------------------------
@@ -221,7 +178,7 @@ type Client struct {
 	commandable
 }
 
-func newClient(opt *options, pool pool) *Client {
+func newClient(opt *Options, pool pool) *Client {
 	base := &baseClient{opt: opt, connPool: pool}
 	return &Client{
 		baseClient:  base,
@@ -229,25 +186,7 @@ func newClient(opt *options, pool pool) *Client {
 	}
 }
 
-func NewClient(clOpt *Options) *Client {
-	opt := clOpt.options()
-	dialer := clOpt.Dialer
-	if dialer == nil {
-		dialer = func() (net.Conn, error) {
-			return net.DialTimeout(clOpt.getNetwork(), clOpt.Addr, opt.DialTimeout)
-		}
-	}
-	return newClient(opt, newConnPool(newConnFunc(dialer), opt))
-}
-
-// Deprecated. Use NewClient instead.
-func NewTCPClient(opt *Options) *Client {
-	opt.Network = "tcp"
-	return NewClient(opt)
-}
-
-// Deprecated. Use NewClient instead.
-func NewUnixClient(opt *Options) *Client {
-	opt.Network = "unix"
-	return NewClient(opt)
+func NewClient(opt *Options) *Client {
+	pool := newConnPool(opt)
+	return newClient(opt, pool)
 }

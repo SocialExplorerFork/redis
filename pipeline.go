@@ -1,89 +1,102 @@
 package redis
 
-// Not thread-safe.
+// Pipeline implements pipelining as described in
+// http://redis.io/topics/pipelining.
+//
+// Pipeline is not thread-safe.
 type Pipeline struct {
 	commandable
 
-	cmds   []Cmder
 	client *baseClient
+
+	cmds   []Cmder
 	closed bool
 }
 
 func (c *Client) Pipeline() *Pipeline {
 	pipe := &Pipeline{
-		client: &baseClient{
-			opt:      c.opt,
-			connPool: c.connPool,
-		},
-		cmds: make([]Cmder, 0, 10),
+		client: c.baseClient,
+		cmds:   make([]Cmder, 0, 10),
 	}
 	pipe.commandable.process = pipe.process
 	return pipe
 }
 
-func (c *Client) Pipelined(f func(*Pipeline) error) ([]Cmder, error) {
-	pc := c.Pipeline()
-	if err := f(pc); err != nil {
+func (c *Client) Pipelined(fn func(*Pipeline) error) ([]Cmder, error) {
+	pipe := c.Pipeline()
+	if err := fn(pipe); err != nil {
 		return nil, err
 	}
-	cmds, err := pc.Exec()
-	pc.Close()
+	cmds, err := pipe.Exec()
+	pipe.Close()
 	return cmds, err
 }
 
-func (c *Pipeline) process(cmd Cmder) {
-	c.cmds = append(c.cmds, cmd)
+func (pipe *Pipeline) process(cmd Cmder) {
+	pipe.cmds = append(pipe.cmds, cmd)
 }
 
-func (c *Pipeline) Close() error {
-	c.closed = true
+func (pipe *Pipeline) Close() error {
+	pipe.Discard()
+	pipe.closed = true
 	return nil
 }
 
-func (c *Pipeline) Discard() error {
-	if c.closed {
+// Discard resets the pipeline and discards queued commands.
+func (pipe *Pipeline) Discard() error {
+	if pipe.closed {
 		return errClosed
 	}
-	c.cmds = c.cmds[:0]
+	pipe.cmds = pipe.cmds[:0]
 	return nil
 }
 
 // Exec always returns list of commands and error of the first failed
 // command if any.
-func (c *Pipeline) Exec() ([]Cmder, error) {
-	if c.closed {
+func (pipe *Pipeline) Exec() (cmds []Cmder, retErr error) {
+	if pipe.closed {
 		return nil, errClosed
 	}
-	if len(c.cmds) == 0 {
-		return []Cmder{}, nil
+	if len(pipe.cmds) == 0 {
+		return pipe.cmds, nil
 	}
 
-	cmds := c.cmds
-	c.cmds = make([]Cmder, 0, 0)
+	cmds = pipe.cmds
+	pipe.cmds = make([]Cmder, 0, 10)
 
-	cn, err := c.client.conn()
-	if err != nil {
-		setCmdsErr(cmds, err)
-		return cmds, err
+	failedCmds := cmds
+	for i := 0; i <= pipe.client.opt.MaxRetries; i++ {
+		cn, err := pipe.client.conn()
+		if err != nil {
+			setCmdsErr(failedCmds, err)
+			return cmds, err
+		}
+
+		if i > 0 {
+			resetCmds(failedCmds)
+		}
+		failedCmds, err = execCmds(cn, failedCmds)
+		pipe.client.putConn(cn, err)
+		if err != nil && retErr == nil {
+			retErr = err
+		}
+		if len(failedCmds) == 0 {
+			break
+		}
 	}
 
-	if err := c.execCmds(cn, cmds); err != nil {
-		c.client.freeConn(cn, err)
-		return cmds, err
-	}
-
-	c.client.putConn(cn)
-	return cmds, nil
+	return cmds, retErr
 }
 
-func (c *Pipeline) execCmds(cn *conn, cmds []Cmder) error {
+func execCmds(cn *conn, cmds []Cmder) ([]Cmder, error) {
 	if err := cn.writeCmds(cmds...); err != nil {
 		setCmdsErr(cmds, err)
-		return err
+		return cmds, err
 	}
 
 	var firstCmdErr error
-	for i, cmd := range cmds {
+	var failedCmds []Cmder
+	for _, cmd := range cmds {
 		err := cmd.parseReply(cn.rd)
 		if err == nil {
 			continue
@@ -91,10 +104,10 @@ func (c *Pipeline) execCmds(cn *conn, cmds []Cmder) error {
 		if firstCmdErr == nil {
 			firstCmdErr = err
 		}
-		if isNetworkError(err) {
-			setCmdsErr(cmds[i:], err)
+		if shouldRetry(err) {
+			failedCmds = append(failedCmds, cmd)
 		}
 	}
 
-	return firstCmdErr
+	return failedCmds, firstCmdErr
 }

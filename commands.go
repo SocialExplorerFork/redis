@@ -470,12 +470,6 @@ func (c *commandable) MSetNX(pairs ...string) *BoolCmd {
 	return cmd
 }
 
-func (c *commandable) PSetEx(key string, expiration time.Duration, value string) *StatusCmd {
-	cmd := NewStatusCmd("PSETEX", key, formatMs(expiration), value)
-	c.Process(cmd)
-	return cmd
-}
-
 func (c *commandable) Set(key, value string, expiration time.Duration) *StatusCmd {
 	args := []string{"SET", key, value}
 	if expiration > 0 {
@@ -497,12 +491,6 @@ func (c *commandable) SetBit(key string, offset int64, value int) *IntCmd {
 		strconv.FormatInt(offset, 10),
 		strconv.FormatInt(int64(value), 10),
 	)
-	c.Process(cmd)
-	return cmd
-}
-
-func (c *commandable) SetEx(key string, expiration time.Duration, value string) *StatusCmd {
-	cmd := NewStatusCmd("SETEX", key, formatSec(expiration), value)
 	c.Process(cmd)
 	return cmd
 }
@@ -870,9 +858,12 @@ type ZStore struct {
 }
 
 func (c *commandable) ZAdd(key string, members ...Z) *IntCmd {
-	args := []string{"ZADD", key}
-	for _, m := range members {
-		args = append(args, formatFloat(m.Score), m.Member)
+	args := make([]string, 2+2*len(members))
+	args[0] = "ZADD"
+	args[1] = key
+	for i, m := range members {
+		args[2+2*i] = formatFloat(m.Score)
+		args[2+2*i+1] = m.Member
 	}
 	cmd := NewIntCmd(args...)
 	c.Process(cmd)
@@ -1118,6 +1109,13 @@ func (c *commandable) ClientKill(ipPort string) *StatusCmd {
 
 func (c *commandable) ClientList() *StringCmd {
 	cmd := NewStringCmd("CLIENT", "LIST")
+	cmd._clusterKeyPos = 0
+	c.Process(cmd)
+	return cmd
+}
+
+func (c *commandable) ClientPause(dur time.Duration) *BoolCmd {
+	cmd := NewBoolCmd("CLIENT", "PAUSE", formatMs(dur))
 	cmd._clusterKeyPos = 0
 	c.Process(cmd)
 	return cmd

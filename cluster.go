@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"log"
 	"math/rand"
 	"strings"
 	"sync"
@@ -13,41 +14,49 @@ type ClusterClient struct {
 
 	addrs   []string
 	slots   [][]string
-	slotsMx sync.RWMutex // protects slots & addrs cache
+	slotsMx sync.RWMutex // Protects slots and addrs.
 
 	clients   map[string]*Client
-	clientsMx sync.RWMutex
+	closed    bool
+	clientsMx sync.RWMutex // Protects clients and closed.
 
 	opt *ClusterOptions
 
-	_reload uint32
+	// Reports where slots reloading is in progress.
+	reloading uint32
 }
 
-// NewClusterClient initializes a new cluster-aware client using given options.
-// A list of seed addresses must be provided.
+// NewClusterClient returns a new Redis Cluster client as described in
+// http://redis.io/topics/cluster-spec.
 func NewClusterClient(opt *ClusterOptions) *ClusterClient {
 	client := &ClusterClient{
 		addrs:   opt.Addrs,
 		slots:   make([][]string, hashSlots),
 		clients: make(map[string]*Client),
 		opt:     opt,
-		_reload: 1,
 	}
 	client.commandable.process = client.process
-	client.reloadIfDue()
-
-	go client.reaper(time.NewTicker(5 * time.Minute))
+	client.reloadSlots()
+	go client.reaper()
 	return client
 }
 
-// Close closes the cluster client.
+// Close closes the cluster client, releasing any open resources.
+//
+// It is rare to Close a Client, as the Client is meant to be
+// long-lived and shared between many goroutines.
 func (c *ClusterClient) Close() error {
-	// TODO: close should make client unusable
+	defer c.clientsMx.Unlock()
+	c.clientsMx.Lock()
+
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	c.resetClients()
 	c.setSlots(nil)
 	return nil
 }
-
-// ------------------------------------------------------------------------
 
 // getClient returns a Client for a given address.
 func (c *ClusterClient) getClient(addr string) (*Client, error) {
@@ -64,11 +73,16 @@ func (c *ClusterClient) getClient(addr string) (*Client, error) {
 	c.clientsMx.RUnlock()
 
 	c.clientsMx.Lock()
+	if c.closed {
+		c.clientsMx.Unlock()
+		return nil, errClosed
+	}
+
 	client, ok = c.clients[addr]
 	if !ok {
 		opt := c.opt.clientOptions()
 		opt.Addr = addr
-		client = NewTCPClient(opt)
+		client = NewClient(opt)
 		c.clients[addr] = client
 	}
 	c.clientsMx.Unlock()
@@ -83,6 +97,14 @@ func (c *ClusterClient) slotAddrs(slot int) []string {
 	return addrs
 }
 
+func (c *ClusterClient) slotMasterAddr(slot int) string {
+	addrs := c.slotAddrs(slot)
+	if len(addrs) > 0 {
+		return addrs[0]
+	}
+	return ""
+}
+
 // randomClient returns a Client for the first live node.
 func (c *ClusterClient) randomClient() (client *Client, err error) {
 	for i := 0; i < 10; i++ {
@@ -91,7 +113,7 @@ func (c *ClusterClient) randomClient() (client *Client, err error) {
 		if err != nil {
 			continue
 		}
-		err = client.Ping().Err()
+		err = client.ClusterInfo().Err()
 		if err == nil {
 			return client, nil
 		}
@@ -102,15 +124,9 @@ func (c *ClusterClient) randomClient() (client *Client, err error) {
 func (c *ClusterClient) process(cmd Cmder) {
 	var ask bool
 
-	c.reloadIfDue()
-
 	slot := hashSlot(cmd.clusterKey())
 
-	var addr string
-	if addrs := c.slotAddrs(slot); len(addrs) > 0 {
-		addr = addrs[0] // First address is master.
-	}
-
+	addr := c.slotMasterAddr(slot)
 	client, err := c.getClient(addr)
 	if err != nil {
 		cmd.setErr(err)
@@ -118,6 +134,10 @@ func (c *ClusterClient) process(cmd Cmder) {
 	}
 
 	for attempt := 0; attempt <= c.opt.getMaxRedirects(); attempt++ {
+		if attempt > 0 {
+			cmd.reset()
+		}
+
 		if ask {
 			pipe := client.Pipeline()
 			pipe.Process(NewCmd("ASKING"))
@@ -140,7 +160,6 @@ func (c *ClusterClient) process(cmd Cmder) {
 			if err != nil {
 				return
 			}
-			cmd.reset()
 			continue
 		}
 
@@ -148,14 +167,13 @@ func (c *ClusterClient) process(cmd Cmder) {
 		var addr string
 		moved, ask, addr = isMovedError(err)
 		if moved || ask {
-			if moved {
-				c.scheduleReload()
+			if moved && c.slotMasterAddr(slot) != addr {
+				c.lazyReloadSlots()
 			}
 			client, err = c.getClient(addr)
 			if err != nil {
 				return
 			}
-			cmd.reset()
 			continue
 		}
 
@@ -165,21 +183,18 @@ func (c *ClusterClient) process(cmd Cmder) {
 
 // Closes all clients and returns last error if there are any.
 func (c *ClusterClient) resetClients() (err error) {
-	c.clientsMx.Lock()
 	for addr, client := range c.clients {
 		if e := client.Close(); e != nil {
 			err = e
 		}
 		delete(c.clients, addr)
 	}
-	c.clientsMx.Unlock()
 	return err
 }
 
 func (c *ClusterClient) setSlots(slots []ClusterSlotInfo) {
 	c.slotsMx.Lock()
 
-	c.resetClients()
 	seen := make(map[string]struct{})
 	for _, addr := range c.addrs {
 		seen[addr] = struct{}{}
@@ -204,81 +219,87 @@ func (c *ClusterClient) setSlots(slots []ClusterSlotInfo) {
 	c.slotsMx.Unlock()
 }
 
-// Closes all connections and reloads slot cache, if due.
-func (c *ClusterClient) reloadIfDue() (err error) {
-	if !atomic.CompareAndSwapUint32(&c._reload, 1, 0) {
-		return
-	}
+func (c *ClusterClient) reloadSlots() {
+	defer atomic.StoreUint32(&c.reloading, 0)
 
 	client, err := c.randomClient()
 	if err != nil {
-		return err
+		log.Printf("redis: randomClient failed: %s", err)
+		return
 	}
 
 	slots, err := client.ClusterSlots().Result()
 	if err != nil {
-		return err
+		log.Printf("redis: ClusterSlots failed: %s", err)
+		return
 	}
 	c.setSlots(slots)
-
-	return nil
 }
 
-// Schedules slots reload on next request.
-func (c *ClusterClient) scheduleReload() {
-	atomic.StoreUint32(&c._reload, 1)
+func (c *ClusterClient) lazyReloadSlots() {
+	if !atomic.CompareAndSwapUint32(&c.reloading, 0, 1) {
+		return
+	}
+	go c.reloadSlots()
 }
 
 // reaper closes idle connections to the cluster.
-func (c *ClusterClient) reaper(ticker *time.Ticker) {
+func (c *ClusterClient) reaper() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 	for _ = range ticker.C {
+		c.clientsMx.RLock()
+
+		if c.closed {
+			c.clientsMx.RUnlock()
+			break
+		}
+
 		for _, client := range c.clients {
 			pool := client.connPool
-			// pool.First removes idle connections from the pool for us. So
-			// just put returned connection back.
+			// pool.First removes idle connections from the pool and
+			// returns first non-idle connection. So just put returned
+			// connection back.
 			if cn := pool.First(); cn != nil {
 				pool.Put(cn)
 			}
 		}
+
+		c.clientsMx.RUnlock()
 	}
 }
 
 //------------------------------------------------------------------------------
 
+// ClusterOptions are used to configure a cluster client and should be
+// passed to NewClusterClient.
 type ClusterOptions struct {
-	// A seed-list of host:port addresses of known cluster nodes
+	// A seed list of host:port addresses of cluster nodes.
 	Addrs []string
 
-	// An optional password
-	Password string
-
-	// The maximum number of MOVED/ASK redirects to follow, before
-	// giving up. Default: 16
+	// The maximum number of MOVED/ASK redirects to follow before
+	// giving up.
+	// Default is 16
 	MaxRedirects int
 
-	// The maximum number of TCP sockets per connection. Default: 5
-	PoolSize int
+	// Following options are copied from Options struct.
 
-	// Timeout settings
-	DialTimeout, ReadTimeout, WriteTimeout, IdleTimeout time.Duration
-}
+	Password string
 
-func (opt *ClusterOptions) getPoolSize() int {
-	if opt.PoolSize < 1 {
-		return 5
-	}
-	return opt.PoolSize
-}
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 
-func (opt *ClusterOptions) getDialTimeout() time.Duration {
-	if opt.DialTimeout == 0 {
-		return 5 * time.Second
-	}
-	return opt.DialTimeout
+	PoolSize    int
+	PoolTimeout time.Duration
+	IdleTimeout time.Duration
 }
 
 func (opt *ClusterOptions) getMaxRedirects() int {
-	if opt.MaxRedirects < 1 {
+	if opt.MaxRedirects == -1 {
+		return 0
+	}
+	if opt.MaxRedirects == 0 {
 		return 16
 	}
 	return opt.MaxRedirects
@@ -286,14 +307,14 @@ func (opt *ClusterOptions) getMaxRedirects() int {
 
 func (opt *ClusterOptions) clientOptions() *Options {
 	return &Options{
-		DB:       0,
 		Password: opt.Password,
 
-		DialTimeout:  opt.getDialTimeout(),
+		DialTimeout:  opt.DialTimeout,
 		ReadTimeout:  opt.ReadTimeout,
 		WriteTimeout: opt.WriteTimeout,
 
-		PoolSize:    opt.getPoolSize(),
+		PoolSize:    opt.PoolSize,
+		PoolTimeout: opt.PoolTimeout,
 		IdleTimeout: opt.IdleTimeout,
 	}
 }
@@ -302,14 +323,19 @@ func (opt *ClusterOptions) clientOptions() *Options {
 
 const hashSlots = 16384
 
-// hashSlot returns a consistent slot number between 0 and 16383
-// for any given string key.
-func hashSlot(key string) int {
+func hashKey(key string) string {
 	if s := strings.IndexByte(key, '{'); s > -1 {
 		if e := strings.IndexByte(key[s+1:], '}'); e > 0 {
 			key = key[s+1 : s+e+1]
 		}
 	}
+	return key
+}
+
+// hashSlot returns a consistent slot number between 0 and 16383
+// for any given string key.
+func hashSlot(key string) int {
+	key = hashKey(key)
 	if key == "" {
 		return rand.Intn(hashSlots)
 	}
